@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Highway Camera Dashboard</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1, h2 {
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .highway-selector {
+            margin-bottom: 20px;
+        }
+        select {
+            padding: 8px;
+            font-size: 16px;
+            border-radius: 4px;
+            border: 1px solid #ccc;
+        }
+        .camera-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        .camera-card {
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .camera-image {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+        }
+        .camera-info {
+            padding: 15px;
+        }
+        .camera-name {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .camera-time {
+            color: #666;
+            font-size: 14px;
+        }
+        .loading {
+            text-align: center;
+            padding: 50px;
+            font-size: 18px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Highway Camera Dashboard</h1>
+        
+        <div class="highway-selector">
+            <label for="highway-select">Select Highway:</label>
+            <select id="highway-select">
+                <option value="">All Highways</option>
+                <!-- Highway options will be added dynamically -->
+            </select>
+        </div>
+        
+        <div id="camera-container" class="camera-grid">
+            <div class="loading">Loading cameras...</div>
+        </div>
+    </div>
+
+    <script>
+        // Highway codes and names from config
+        const HIGHWAYS = {
+            "NKV": "L/raya Baru Lembah Klang (NKVE)",
+            "PLS": "L/raya Utara Selatan (PLUS Utara)",
+            "SPL": "L/raya Utara Selatan (PLUS Selatan)",
+            "LINK2": "L/raya Hubungan Kedua Malaysia Singapura (LINK2)",
+            "KSS": "L/raya Shah Alam (KESAS)",
+            "ELT": "L/raya Utara Selatan Hubungan Tengah (ELITE)",
+            "CKH": "L/raya Cheras Kajang (GRANDSAGA)",
+            "KLK": "L/raya KL-Karak (KLK)",
+            "LPT": "L/raya Pantai Timur Fasa 1 (LPT1)",
+            "ECE2": "L/raya Pantai Timur Fasa 2 (LPT2)",
+            "BES": "L/raya BESRAYA (BES)",
+            "NPE": "L/raya Pantai Baharu (NPE)",
+        };
+
+        // Populate highway selector
+        const highwaySelect = document.getElementById('highway-select');
+        Object.entries(HIGHWAYS).forEach(([code, name]) => {
+            const option = document.createElement('option');
+            option.value = code;
+            option.textContent = name;
+            highwaySelect.appendChild(option);
+        });
+
+        // Fetch and display cameras
+        async function fetchCameras(highwayCode = '') {
+            const cameraContainer = document.getElementById('camera-container');
+            cameraContainer.innerHTML = '<div class="loading">Loading cameras...</div>';
+            
+            try {
+                const url = `/api/images/latest${highwayCode ? `?highway_code=${highwayCode}` : ''}`;
+                const response = await fetch(url);
+                
+                if (!response.ok) {
+                    throw new Error(`Error fetching cameras: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                if (data.images.length === 0) {
+                    cameraContainer.innerHTML = '<div class="loading">No cameras found</div>';
+                    return;
+                }
+                
+                // Clear loading message
+                cameraContainer.innerHTML = '';
+                
+                // Add camera cards
+                data.images.forEach(image => {
+                    const card = document.createElement('div');
+                    card.className = 'camera-card';
+                    
+                    const imgElement = document.createElement('img');
+                    imgElement.className = 'camera-image';
+                    imgElement.src = image.image_path;
+                    imgElement.alt = image.camera.name;
+                    
+                    const infoDiv = document.createElement('div');
+                    infoDiv.className = 'camera-info';
+                    
+                    const nameDiv = document.createElement('div');
+                    nameDiv.className = 'camera-name';
+                    nameDiv.textContent = image.camera.name;
+                    
+                    const highwayDiv = document.createElement('div');
+                    highwayDiv.textContent = image.highway.name;
+                    
+                    const timeDiv = document.createElement('div');
+                    timeDiv.className = 'camera-time';
+                    const captureTime = new Date(image.capture_time);
+                    timeDiv.textContent = `Updated: ${captureTime.toLocaleString()}`;
+                    
+                    infoDiv.appendChild(nameDiv);
+                    infoDiv.appendChild(highwayDiv);
+                    infoDiv.appendChild(timeDiv);
+                    
+                    card.appendChild(imgElement);
+                    card.appendChild(infoDiv);
+                    
+                    cameraContainer.appendChild(card);
+                });
+                
+            } catch (error) {
+                console.error('Error:', error);
+                cameraContainer.innerHTML = `<div class="loading">Error loading cameras: ${error.message}</div>`;
+            }
+        }
+
+        // Initial load
+        fetchCameras();
+        
+        // Handle highway selection
+        highwaySelect.addEventListener('change', (event) => {
+            fetchCameras(event.target.value);
+        });
+        
+        // Auto-refresh every 5 minutes
+        setInterval(() => {
+            fetchCameras(highwaySelect.value);
+        }, 5 * 60 * 1000);
+    </script>
+</body>
+</html> 

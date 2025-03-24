@@ -1,7 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    StreamingResponse,
+    HTMLResponse,
+)
+from fastapi.templating import Jinja2Templates
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
@@ -17,6 +23,20 @@ from typing import Dict, List, AsyncGenerator
 import json
 import base64
 import re
+from dotenv import load_dotenv
+from .db import (
+    init_collections,
+    save_highway,
+    save_camera,
+    save_camera_image,
+    get_latest_camera_images,
+)
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Get configuration from environment variables
+SCRAPE_INTERVAL_MINUTES = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "5"))
 
 # Configure logging
 logger.add("scraper.log", rotation="500 MB")
@@ -55,6 +75,9 @@ scheduler = AsyncIOScheduler()
 
 # Store active highways
 active_highways: Dict[str, Highway] = {}
+
+# Configure templates
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
 async def fetch_camera_data(highway_code: str) -> List[Dict]:
@@ -174,6 +197,13 @@ async def update_highway_data(highway_code: str):
                 return
             return
 
+        # Save highway to PocketBase
+        await save_highway(
+            highway_code=highway_code,
+            highway_name=HIGHWAYS[highway_code]["name"],
+            highway_id=HIGHWAYS[highway_code]["id"],
+        )
+
         # Update highway cameras
         highway = Highway(
             code=highway_code,
@@ -200,6 +230,15 @@ async def update_highway_data(highway_code: str):
         logger.info(
             f"Updated {len(highway.cameras)} cameras for highway {highway_code}"
         )
+
+        # Save cameras to PocketBase
+        for camera in highway.cameras:
+            await save_camera(
+                camera_id=camera.camera_id,
+                name=camera.name,
+                location_id=camera.location_id,
+                highway_code=highway_code,
+            )
 
         # Save images if present
         timestamp = datetime.now()
@@ -270,6 +309,14 @@ async def update_highway_data(highway_code: str):
                 async with aiofiles.open(metadata_path, "w") as f:
                     await f.write(json.dumps(metadata, indent=2))
 
+                # Save to PocketBase
+                await save_camera_image(
+                    camera_id=camera.camera_id,
+                    image_path=f"/static/{filename}",
+                    timestamp=timestamp,
+                    file_size=len(image_data),
+                )
+
                 saved_count += 1
                 logger.info(
                     f"Saved image ({len(image_data)} bytes) and metadata for camera {camera.name} ({camera.camera_id})"
@@ -294,6 +341,27 @@ async def update_highway_data(highway_code: str):
 async def startup_event():
     """Initialize the application"""
     try:
+        logger.info("Starting highway monitoring application...")
+
+        # Initialize PocketBase collections
+        try:
+            logger.info("Initializing PocketBase collections...")
+            pb_init_result = await init_collections()
+            if pb_init_result:
+                logger.info("PocketBase collections initialized successfully")
+            else:
+                logger.warning(
+                    "PocketBase collections initialization skipped or failed"
+                )
+                logger.warning(
+                    "You may need to create collections manually through the PocketBase admin UI"
+                )
+        except Exception as pb_error:
+            logger.error(f"Error initializing PocketBase: {str(pb_error)}")
+            logger.warning(
+                "Continuing with application startup despite PocketBase initialization error"
+            )
+
         # Initialize highways from static config
         for code, highway_data in HIGHWAYS.items():
             highway = Highway(
@@ -307,7 +375,7 @@ async def startup_event():
             # Add scheduler job for each highway
             scheduler.add_job(
                 update_highway_data,
-                trigger=IntervalTrigger(minutes=5),  # Set to run every 5 minutes
+                trigger=IntervalTrigger(minutes=SCRAPE_INTERVAL_MINUTES),
                 args=[code],
                 id=f"update_{code}",
                 replace_existing=True,
@@ -322,6 +390,7 @@ async def startup_event():
         )
     except Exception as e:
         logger.error(f"Error in startup: {str(e)}")
+        logger.exception("Full startup error traceback:")
         raise
 
 
@@ -514,3 +583,22 @@ async def health_check():
         "active_highways": len(active_highways),
         "image_count": len(list(IMAGES_DIR.glob("*.jpg"))),
     }
+
+
+# Add a new endpoint to get data from PocketBase
+@app.get("/api/images/latest")
+async def get_latest_images(highway_code: str = None, limit: int = 20):
+    """Get latest images from PocketBase"""
+    try:
+        images = await get_latest_camera_images(highway_code, limit)
+        return {"count": len(images), "images": images}
+    except Exception as e:
+        logger.error(f"Error getting latest images: {str(e)}")
+        logger.exception("Full error traceback:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root(request):
+    """Serve the main dashboard"""
+    return templates.TemplateResponse("index.html", {"request": request})
