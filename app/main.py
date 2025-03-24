@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
@@ -10,18 +10,18 @@ import asyncio
 import os
 from datetime import datetime
 from pathlib import Path
-from .models import CCTVImage, CCTVLocation, CCTVCamera
+from .models import CCTVCamera, Highway, HighwayList
+from .config import HIGHWAYS, get_highway_list
 import aiofiles
-from typing import Dict, List
+from typing import Dict, List, AsyncGenerator
 import json
-from starlette.responses import Response
-from starlette.background import BackgroundTask
-import time
+import base64
+import re
 
 # Configure logging
 logger.add("scraper.log", rotation="500 MB")
 
-app = FastAPI(title="JalanOw Analytics API")
+app = FastAPI(title="LLM Highway Analytics API")
 
 # Configure CORS - More permissive for development
 app.add_middleware(
@@ -34,322 +34,496 @@ app.add_middleware(
 )
 
 # Create storage directory with absolute path
-STORAGE_DIR = Path(__file__).parent.parent / "storage" / "images"
+STORAGE_DIR = Path(__file__).parent.parent / "storage"
+IMAGES_DIR = STORAGE_DIR / "images"
+METADATA_DIR = STORAGE_DIR / "metadata"
+
+# Create necessary directories
 STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+METADATA_DIR.mkdir(parents=True, exist_ok=True)
+
 logger.info(f"Storage directory: {STORAGE_DIR}")
-
-
-# Custom static files handler with CORS headers
-class CORSStaticFiles(StaticFiles):
-    async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] == "http":
-            response = await super().__call__(scope, receive, send)
-            if isinstance(response, Response):
-                response.headers["Access-Control-Allow-Origin"] = "*"
-                response.headers["Cache-Control"] = "no-cache"
-                return response
-        return await super().__call__(scope, receive, send)
-
+logger.info(f"Images directory: {IMAGES_DIR}")
+logger.info(f"Metadata directory: {METADATA_DIR}")
 
 # Mount static directory for serving images with CORS
-app.mount("/static", CORSStaticFiles(directory=str(STORAGE_DIR)), name="static")
+app.mount("/static", StaticFiles(directory=str(IMAGES_DIR)), name="static")
 
 # Initialize scheduler
 scheduler = AsyncIOScheduler()
 
-# Store active locations
-active_locations: Dict[str, CCTVLocation] = {}
+# Store active highways
+active_highways: Dict[str, Highway] = {}
 
 
-async def fetch_image_with_retry(
-    client: httpx.AsyncClient, camera: CCTVCamera, max_retries: int = 3
-) -> CCTVImage:
-    """Fetch a single CCTV image with retries"""
-    last_error = None
+async def fetch_camera_image(highway_code: str, camera_id: str) -> bytes:
+    """Fetch image for a specific camera"""
+    try:
+        url = f"https://www.llm.gov.my/assets/ajax.vigroot.php?h={highway_code}&c={camera_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Referer": "https://www.llm.gov.my/",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+        }
 
-    for attempt in range(max_retries):
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                "Referer": "https://www.jalanow.com/",
-                "Accept": "image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-            }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
 
-            url = str(camera.url)
-            logger.info(
-                f"Fetching image from {url} (attempt {attempt + 1}/{max_retries})"
+            # Extract base64 image from response
+            data = response.json()
+            if "image" in data:
+                # Remove data:image/jpeg;base64, prefix if present
+                base64_data = data["image"].split(",")[-1]
+                return base64.b64decode(base64_data)
+
+            raise ValueError("No image data in response")
+
+    except Exception as e:
+        logger.error(
+            f"Error fetching image for camera {camera_id} on highway {highway_code}: {str(e)}"
+        )
+        raise
+
+
+async def fetch_camera_data(highway_code: str) -> List[Dict]:
+    """Fetch camera data for a specific highway"""
+    try:
+        url = f"https://www.llm.gov.my/assets/ajax.vigroot.php?h={highway_code}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer": "https://www.llm.gov.my/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection": "keep-alive",
+            "Cookie": "PHPSESSID=1",
+        }
+
+        async with httpx.AsyncClient(timeout=30.0, verify=False) as client:
+            response = await client.get(url, headers=headers, follow_redirects=True)
+            response.raise_for_status()
+
+            # Log raw response for debugging
+            logger.debug(f"Raw response for {highway_code}: {response.text[:1000]}...")
+
+            # Try multiple parsing approaches
+            cameras = []
+            text = response.text
+
+            # Approach 1: Look for div elements with camera data
+            camera_divs = re.findall(
+                r'<div[^>]*class="[^"]*camera[^"]*"[^>]*>(.*?)</div>',
+                text,
+                re.DOTALL | re.IGNORECASE,
             )
+            if camera_divs:
+                logger.info(f"Found {len(camera_divs)} camera divs for {highway_code}")
+                for i, div in enumerate(camera_divs):
+                    # Extract camera ID from div attributes or content
+                    cam_id_match = re.search(
+                        r'data-camera-id=["\']([^"\']+)["\']', div
+                    ) or re.search(r'id=["\']camera-([^"\']+)["\']', div)
+                    cam_id = (
+                        cam_id_match.group(1)
+                        if cam_id_match
+                        else f"{highway_code}-{i+1}"
+                    )
 
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                response = await client.get(url, headers=headers)
-                response.raise_for_status()
+                    # Extract camera name
+                    name_match = re.search(
+                        r'data-name=["\']([^"\']+)["\']', div
+                    ) or re.search(r'title=["\']([^"\']+)["\']', div)
+                    name = name_match.group(1) if name_match else f"Camera {i+1}"
 
-                if len(response.content) < 1000:  # Basic check for valid image
-                    raise ValueError("Response too small to be a valid image")
+                    # Extract image data
+                    img_match = re.search(
+                        r'src=["\'](data:image/[^"\']+)["\']', div
+                    ) or re.search(r'data:image/[^"\';\s]+;base64,[^"\';\s]+', div)
+                    if img_match:
+                        image_data = img_match.group(1)
+                        cameras.append(
+                            {"id": cam_id, "name": name, "image": image_data}
+                        )
 
-                # Generate filename with timestamp
-                timestamp = datetime.now()
-                filename = f"{camera.location_id}_{camera.camera_id}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
-                file_path = STORAGE_DIR / filename
+            # Approach 2: Look for img tags with base64 data
+            if not cameras:
+                img_matches = re.findall(
+                    r'<img[^>]*src=["\'](data:image/[^"\']+)["\'][^>]*>', text
+                )
+                if img_matches:
+                    logger.info(
+                        f"Found {len(img_matches)} image tags for {highway_code}"
+                    )
+                    for i, img_data in enumerate(img_matches):
+                        cameras.append(
+                            {
+                                "id": f"{highway_code}-{i+1}",
+                                "name": f"Camera {i+1}",
+                                "image": img_data,
+                            }
+                        )
+
+            # Approach 3: Look for base64 data directly
+            if not cameras:
+                base64_matches = re.findall(
+                    r'data:image/(?:jpeg|png|gif);base64,([^"\'}\s]+)', text
+                )
+                if base64_matches:
+                    logger.info(
+                        f"Found {len(base64_matches)} base64 images for {highway_code}"
+                    )
+                    for i, img_data in enumerate(base64_matches):
+                        cameras.append(
+                            {
+                                "id": f"{highway_code}-{i+1}",
+                                "name": f"Camera {i+1}",
+                                "image": f"data:image/jpeg;base64,{img_data}",
+                            }
+                        )
+
+            if cameras:
+                logger.info(
+                    f"Successfully extracted {len(cameras)} cameras for {highway_code}"
+                )
+                return cameras
+
+            logger.error(f"No camera data found in HTML response for {highway_code}")
+            logger.debug(
+                f"Response content: {text[:500]}..."
+            )  # Log first 500 chars for debugging
+            return []
+
+    except httpx.RequestError as e:
+        logger.error(
+            f"Network error fetching data for highway {highway_code}: {str(e)}"
+        )
+        return []
+    except Exception as e:
+        logger.error(f"Error fetching camera data for highway {highway_code}: {str(e)}")
+        logger.exception("Full error traceback:")
+        return []
+
+
+async def update_highway_data(highway_code: str):
+    """Update data for a specific highway"""
+    try:
+        if highway_code not in HIGHWAYS:
+            logger.error(f"Unknown highway code: {highway_code}")
+            return
+
+        cameras_data = await fetch_camera_data(highway_code)
+
+        if not cameras_data:
+            logger.warning(f"No cameras found for highway {highway_code}")
+            # Keep existing cameras if we have them
+            if (
+                highway_code in active_highways
+                and active_highways[highway_code].cameras
+            ):
+                logger.info(
+                    f"Keeping existing {len(active_highways[highway_code].cameras)} cameras for {highway_code}"
+                )
+                return
+            return
+
+        # Update highway cameras
+        highway = Highway(
+            code=highway_code,
+            id=HIGHWAYS[highway_code]["id"],
+            name=HIGHWAYS[highway_code]["name"],
+            cameras=[
+                CCTVCamera(
+                    camera_id=str(cam.get("id", f"{highway_code}-{i}")),
+                    location_id=highway_code,
+                    name=cam.get("name", f"Camera {i+1}"),
+                    url=f"https://www.llm.gov.my/assets/ajax.vigroot.php?h={highway_code}&c={cam.get('id', '')}",
+                    base64_image=cam.get("image", ""),
+                    last_updated=datetime.now(),
+                )
+                for i, cam in enumerate(cameras_data)
+                if cam.get("image")
+                or cam.get("id")  # Only include cameras with either image or ID
+            ],
+        )
+
+        if not highway.cameras:
+            logger.warning(f"No valid cameras found in data for highway {highway_code}")
+            return
+
+        active_highways[highway_code] = highway
+        logger.info(
+            f"Updated {len(highway.cameras)} cameras for highway {highway_code}"
+        )
+
+        # Save images if present
+        timestamp = datetime.now()
+        saved_count = 0
+
+        for camera in highway.cameras:
+            try:
+                if not camera.base64_image:
+                    logger.warning(
+                        f"No image data for camera {camera.camera_id} ({camera.name})"
+                    )
+                    continue
+
+                # Remove data:image/jpeg;base64, prefix if present
+                base64_data = camera.base64_image.split(",")[-1].strip()
+                if not base64_data:
+                    logger.warning(
+                        f"Empty base64 data for camera {camera.camera_id} ({camera.name})"
+                    )
+                    continue
+
+                try:
+                    image_data = base64.b64decode(base64_data)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to decode base64 data for camera {camera.camera_id} ({camera.name}): {str(e)}"
+                    )
+                    continue
+
+                # Validate image data
+                if len(image_data) < 100:  # Basic size check
+                    logger.warning(
+                        f"Suspiciously small image data ({len(image_data)} bytes) for camera {camera.camera_id}"
+                    )
+                    continue
+
+                # Create filename with camera details - use NKVE for consistency
+                highway_prefix = "NKVE" if highway_code == "NKV" else highway_code
+                filename = f"{highway_prefix}_{camera.camera_id}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
+                file_path = IMAGES_DIR / filename
 
                 # Save image
                 async with aiofiles.open(file_path, "wb") as f:
-                    await f.write(response.content)
+                    await f.write(image_data)
 
-                logger.info(f"Successfully saved image to {file_path}")
+                # Save metadata
+                metadata = {
+                    "highway_code": highway_code,
+                    "highway_name": HIGHWAYS[highway_code]["name"],
+                    "camera_id": camera.camera_id,
+                    "camera_name": camera.name,
+                    "timestamp": timestamp.isoformat(),
+                    "image_path": str(file_path),
+                    "image_size_bytes": len(image_data),
+                }
 
-                return CCTVImage(
-                    url=camera.url,
-                    location_id=camera.location_id,
-                    camera_id=camera.camera_id,
-                    name=camera.name,
-                    timestamp=timestamp,
-                    status="success",
+                metadata_path = METADATA_DIR / f"{filename.replace('.jpg', '.json')}"
+                async with aiofiles.open(metadata_path, "w") as f:
+                    await f.write(json.dumps(metadata, indent=2))
+
+                saved_count += 1
+                logger.info(
+                    f"Saved image ({len(image_data)} bytes) and metadata for camera {camera.name} ({camera.camera_id})"
                 )
 
-        except Exception as e:
-            last_error = e
-            logger.warning(
-                f"Attempt {attempt + 1}/{max_retries} failed for {url}: {str(e)}"
-            )
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1 * (attempt + 1))  # Exponential backoff
-            continue
+            except Exception as e:
+                logger.error(
+                    f"Error saving image for camera {camera.camera_id} ({camera.name}): {str(e)}"
+                )
+                logger.exception("Full error traceback:")
 
-    logger.error(f"All attempts failed for {url}: {str(last_error)}")
-    return CCTVImage(
-        url=camera.url,
-        location_id=camera.location_id,
-        camera_id=camera.camera_id,
-        name=camera.name,
-        timestamp=datetime.now(),
-        status="error",
-        error_message=str(last_error),
-    )
-
-
-async def fetch_location_images(location: CCTVLocation):
-    """Fetch all images for a location"""
-    try:
-        tasks = []
-        for camera in location.cameras:
-            task = fetch_image_with_retry(None, camera)  # client is created per retry
-            tasks.append(task)
-
-        results = await asyncio.gather(*tasks)
-
-        # Log results
-        success_count = sum(1 for r in results if r.status == "success")
         logger.info(
-            f"Fetched {success_count}/{len(tasks)} images for {location.location_id}"
+            f"Successfully saved {saved_count} out of {len(highway.cameras)} images for highway {highway_code}"
         )
 
-        # Schedule immediate retry for failed cameras
-        if success_count < len(tasks):
-            failed_cameras = [
-                camera
-                for camera, result in zip(location.cameras, results)
-                if result.status == "error"
-            ]
-            logger.warning(
-                f"Scheduling immediate retry for {len(failed_cameras)} failed cameras"
-            )
-            for camera in failed_cameras:
-                asyncio.create_task(fetch_image_with_retry(None, camera))
-
     except Exception as e:
-        logger.error(f"Error in fetch_location_images: {str(e)}")
+        logger.error(f"Error updating highway {highway_code}: {str(e)}")
+        logger.exception("Full error traceback:")
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize the application"""
     try:
-        # Add initial location
-        nkve_location = CCTVLocation(
-            location_id="NKVE",
-            name="New Klang Valley Expressway",
-            base_url="https://www.jalanow.com/malaysia-highway-E1-NKVE-New-Klang-Valley-Expressway-live-traffic-cam.php",
-            cameras=[
-                CCTVCamera(
-                    camera_id="NKVE-11",
-                    location_id="NKVE",
-                    name="NKVE DAMANSARA KM17.95 NB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-11.jpg",
-                ),
-                CCTVCamera(
-                    camera_id="NKVE-12",
-                    location_id="NKVE",
-                    name="NKVE DAMANSARA KM17.95 SB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-12.jpg",
-                ),
-                CCTVCamera(
-                    camera_id="NKVE-21",
-                    location_id="NKVE",
-                    name="NKVE JALAN DUTA KM14.7 NB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-21.jpg",
-                ),
-                CCTVCamera(
-                    camera_id="NKVE-22",
-                    location_id="NKVE",
-                    name="NKVE JALAN DUTA KM14.7 SB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-22.jpg",
-                ),
-                CCTVCamera(
-                    camera_id="NKVE-31",
-                    location_id="NKVE",
-                    name="NKVE SEGAMBUT KM12.6 NB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-31.jpg",
-                ),
-                CCTVCamera(
-                    camera_id="NKVE-32",
-                    location_id="NKVE",
-                    name="NKVE SEGAMBUT KM12.6 SB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-32.jpg",
-                ),
-                CCTVCamera(
-                    camera_id="NKVE-41",
-                    location_id="NKVE",
-                    name="NKVE JALAN IPOH KM10.5 NB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-41.jpg",
-                ),
-                CCTVCamera(
-                    camera_id="NKVE-42",
-                    location_id="NKVE",
-                    name="NKVE JALAN IPOH KM10.5 SB",
-                    url="https://w6.fgies.com//sd-nkve/NKVE-42.jpg",
-                ),
-            ],
-        )
-        active_locations[nkve_location.location_id] = nkve_location
+        # Initialize highways from static config
+        for code, highway_data in HIGHWAYS.items():
+            highway = Highway(
+                id=highway_data["id"],
+                code=code,
+                name=highway_data["name"],
+                cameras=[],  # Start with empty cameras list
+            )
+            active_highways[code] = highway
 
-        # Fetch images immediately
-        await fetch_location_images(nkve_location)
-
-        # Start scheduler
+        # Add specific scheduler job for NKV highway
         scheduler.add_job(
-            fetch_location_images,
-            trigger=IntervalTrigger(minutes=3),
-            args=[nkve_location],
-            id=f"fetch_{nkve_location.location_id}",
+            update_highway_data,
+            trigger=IntervalTrigger(minutes=5),  # Set to run every 5 minutes
+            args=["NKV"],
+            id="update_NKV",
+            replace_existing=True,
         )
-        scheduler.start()
 
-        logger.info("Application startup complete")
+        # Fetch initial data asynchronously
+        asyncio.create_task(update_highway_data("NKV"))
+
+        scheduler.start()
+        logger.info("Application startup complete. Initialized NKV highway monitoring.")
     except Exception as e:
         logger.error(f"Error in startup: {str(e)}")
         raise
 
 
-@app.get("/images/{location_id}")
-async def get_location_images(location_id: str, limit: int = 10):
-    """Get recent images for a location"""
-    try:
-        if location_id not in active_locations:
-            raise HTTPException(status_code=404, detail="Location not found")
-
-        # Get list of image files for location
-        image_files = sorted(
-            [f for f in STORAGE_DIR.glob(f"{location_id}_*.jpg")],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )[:limit]
-
-        if not image_files:
-            # Try to fetch images immediately if none found
-            await fetch_location_images(active_locations[location_id])
-            await asyncio.sleep(2)  # Give time for images to be saved
-            # Check again
-            image_files = sorted(
-                [f for f in STORAGE_DIR.glob(f"{location_id}_*.jpg")],
-                key=lambda x: x.stat().st_mtime,
-                reverse=True,
-            )[:limit]
-
-        base_url = str(httpx.URL(os.getenv("BASE_URL", "http://localhost:8000")))
-
-        return {
-            "location": active_locations[location_id],
-            "images": [
-                {
-                    "filename": f.name,
-                    "camera_id": f.name.split("_")[1],
-                    "camera_name": next(
-                        (
-                            cam.name
-                            for cam in active_locations[location_id].cameras
-                            if cam.camera_id == f.name.split("_")[1]
-                        ),
-                        "Unknown Camera",
-                    ),
-                    "timestamp": datetime.fromtimestamp(f.stat().st_mtime),
-                    "url": f"{base_url}/static/{f.name}",
-                    "size": f.stat().st_size,
-                }
-                for f in image_files
-            ],
-        }
-
-    except Exception as e:
-        logger.error(f"Error in get_location_images: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/highways", response_model=HighwayList)
+async def get_highways():
+    """Get list of all highways"""
+    highways = [
+        Highway(
+            id=data["id"],
+            code=code,
+            name=data["name"],
+            cameras=active_highways[code].cameras if code in active_highways else [],
+        )
+        for code, data in HIGHWAYS.items()
+    ]
+    return HighwayList(highways=highways)
 
 
-@app.get("/locations")
-async def get_locations():
-    """Get list of active locations"""
-    return list(active_locations.values())
+@app.get("/highways/{highway_code}")
+async def get_highway(highway_code: str):
+    """Get details for a specific highway"""
+    if highway_code not in HIGHWAYS:
+        raise HTTPException(status_code=404, detail="Highway not found")
+
+    highway_data = HIGHWAYS[highway_code]
+    cameras = (
+        active_highways[highway_code].cameras if highway_code in active_highways else []
+    )
+
+    return Highway(
+        id=highway_data["id"],
+        code=highway_code,
+        name=highway_data["name"],
+        cameras=cameras,
+    )
 
 
-@app.get("/images/latest/{location_id}/{camera_id}")
-async def get_latest_image(location_id: str, camera_id: str):
+@app.get("/highways/{highway_code}/cameras")
+async def get_highway_cameras(highway_code: str):
+    """Get all cameras for a specific highway"""
+    if highway_code not in active_highways:
+        raise HTTPException(status_code=404, detail="Highway not found")
+    return active_highways[highway_code].cameras
+
+
+async def stream_image_chunks(
+    image_path: Path, chunk_size: int = 8192
+) -> AsyncGenerator[bytes, None]:
+    """Stream image file in chunks"""
+    async with aiofiles.open(image_path, "rb") as f:
+        while chunk := await f.read(chunk_size):
+            yield chunk
+
+
+@app.get("/highways/{highway_code}/cameras/{camera_id}/latest")
+async def get_latest_camera_image(highway_code: str, camera_id: str):
     """Get the latest image for a specific camera"""
     try:
-        if location_id not in active_locations:
-            raise HTTPException(status_code=404, detail="Location not found")
+        if highway_code not in active_highways:
+            raise HTTPException(status_code=404, detail="Highway not found")
+
+        # Use NKVE prefix for consistency
+        highway_prefix = "NKVE" if highway_code == "NKV" else highway_code
 
         # Find the latest image for this camera
         image_files = sorted(
-            [f for f in STORAGE_DIR.glob(f"{location_id}_{camera_id}_*.jpg")],
+            [f for f in IMAGES_DIR.glob(f"{highway_prefix}_{camera_id}_*.jpg")],
             key=lambda x: x.stat().st_mtime,
             reverse=True,
         )
 
         if not image_files:
-            # Try to fetch new images
-            camera = next(
-                (
-                    cam
-                    for cam in active_locations[location_id].cameras
-                    if cam.camera_id == camera_id
-                ),
-                None,
+            # Try to fetch new image
+            await update_highway_data(highway_code)
+            # Check again
+            image_files = sorted(
+                [f for f in IMAGES_DIR.glob(f"{highway_prefix}_{camera_id}_*.jpg")],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
             )
-            if camera:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    await fetch_image_with_retry(client, camera)
-                # Check again
-                image_files = sorted(
-                    [f for f in STORAGE_DIR.glob(f"{location_id}_{camera_id}_*.jpg")],
-                    key=lambda x: x.stat().st_mtime,
-                    reverse=True,
-                )
 
         if not image_files:
             raise HTTPException(
                 status_code=404, detail="No images found for this camera"
             )
 
-        return FileResponse(
-            str(image_files[0]), media_type="image/jpeg", filename=image_files[0].name
+        latest_image = image_files[0]
+        metadata_file = METADATA_DIR / f"{latest_image.stem}.json"
+
+        # Read metadata if available
+        metadata = None
+        if metadata_file.exists():
+            async with aiofiles.open(metadata_file, "r") as f:
+                metadata = json.loads(await f.read())
+
+        # Stream the image response
+        return StreamingResponse(
+            stream_image_chunks(latest_image),
+            media_type="image/jpeg",
+            headers={
+                "Content-Disposition": f'attachment; filename="{latest_image.name}"',
+                "X-Image-Metadata": json.dumps(metadata) if metadata else "",
+            },
         )
+
     except Exception as e:
-        logger.error(f"Error in get_latest_image: {str(e)}")
+        logger.error(f"Error in get_latest_camera_image: {str(e)}")
+        logger.exception("Full error traceback:")
         if isinstance(e, HTTPException):
             raise
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/highways/{highway_code}/latest")
+async def get_highway_latest_images(highway_code: str):
+    """Get the latest images and metadata for a specific highway"""
+    try:
+        if highway_code not in HIGHWAYS:
+            raise HTTPException(status_code=404, detail="Highway not found")
+
+        # Use NKVE prefix for consistency
+        highway_prefix = "NKVE" if highway_code == "NKV" else highway_code
+
+        # Find all images for this highway
+        image_files = sorted(
+            [f for f in IMAGES_DIR.glob(f"{highway_prefix}_*.jpg")],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+
+        images = []
+        for image_file in image_files:
+            # Get corresponding metadata file
+            metadata_file = METADATA_DIR / f"{image_file.stem}.json"
+
+            if metadata_file.exists():
+                async with aiofiles.open(metadata_file, "r") as f:
+                    metadata = json.loads(await f.read())
+                    images.append(
+                        {
+                            "image_url": f"/static/{image_file.name}",
+                            "metadata": metadata,
+                        }
+                    )
+
+        return {
+            "highway_code": highway_code,
+            "highway_name": HIGHWAYS[highway_code]["name"],
+            "images": images,
+        }
+
+    except Exception as e:
+        logger.error(
+            f"Error getting latest images for highway {highway_code}: {str(e)}"
+        )
+        logger.exception("Full error traceback:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -361,6 +535,6 @@ async def health_check():
         "storage_dir": str(STORAGE_DIR),
         "storage_exists": STORAGE_DIR.exists(),
         "storage_is_dir": STORAGE_DIR.is_dir(),
-        "active_locations": len(active_locations),
-        "image_count": len(list(STORAGE_DIR.glob("*.jpg"))),
+        "active_highways": len(active_highways),
+        "image_count": len(list(IMAGES_DIR.glob("*.jpg"))),
     }
