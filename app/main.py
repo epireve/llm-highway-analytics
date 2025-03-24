@@ -57,38 +57,6 @@ scheduler = AsyncIOScheduler()
 active_highways: Dict[str, Highway] = {}
 
 
-async def fetch_camera_image(highway_code: str, camera_id: str) -> bytes:
-    """Fetch image for a specific camera"""
-    try:
-        url = f"https://www.llm.gov.my/assets/ajax.vigroot.php?h={highway_code}&c={camera_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Referer": "https://www.llm.gov.my/",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-
-            # Extract base64 image from response
-            data = response.json()
-            if "image" in data:
-                # Remove data:image/jpeg;base64, prefix if present
-                base64_data = data["image"].split(",")[-1]
-                return base64.b64decode(base64_data)
-
-            raise ValueError("No image data in response")
-
-    except Exception as e:
-        logger.error(
-            f"Error fetching image for camera {camera_id} on highway {highway_code}: {str(e)}"
-        )
-        raise
-
-
 async def fetch_camera_data(highway_code: str) -> List[Dict]:
     """Fetch camera data for a specific highway"""
     try:
@@ -114,60 +82,38 @@ async def fetch_camera_data(highway_code: str) -> List[Dict]:
             cameras = []
             text = response.text
 
-            # Approach 1: Look for div elements with camera data
-            camera_divs = re.findall(
-                r'<div[^>]*class="[^"]*camera[^"]*"[^>]*>(.*?)</div>',
-                text,
-                re.DOTALL | re.IGNORECASE,
+            # Try to find image and name pairs - first approach with img and div pattern
+            img_tags = re.findall(
+                r'<img[^>]*src=["\'](data:image/[^"\']+)["\'][^>]*>', text
             )
-            if camera_divs:
-                logger.info(f"Found {len(camera_divs)} camera divs for {highway_code}")
-                for i, div in enumerate(camera_divs):
-                    # Extract camera ID from div attributes or content
-                    cam_id_match = re.search(
-                        r'data-camera-id=["\']([^"\']+)["\']', div
-                    ) or re.search(r'id=["\']camera-([^"\']+)["\']', div)
-                    cam_id = (
-                        cam_id_match.group(1)
-                        if cam_id_match
-                        else f"{highway_code}-{i+1}"
-                    )
+            name_divs = re.findall(r'<div style="width:320px;">(.*?)</div>', text)
 
-                    # Extract camera name
-                    name_match = re.search(
-                        r'data-name=["\']([^"\']+)["\']', div
-                    ) or re.search(r'title=["\']([^"\']+)["\']', div)
-                    name = name_match.group(1) if name_match else f"Camera {i+1}"
-
-                    # Extract image data
-                    img_match = re.search(
-                        r'src=["\'](data:image/[^"\']+)["\']', div
-                    ) or re.search(r'data:image/[^"\';\s]+;base64,[^"\';\s]+', div)
-                    if img_match:
-                        image_data = img_match.group(1)
-                        cameras.append(
-                            {"id": cam_id, "name": name, "image": image_data}
-                        )
-
-            # Approach 2: Look for img tags with base64 data
-            if not cameras:
-                img_matches = re.findall(
-                    r'<img[^>]*src=["\'](data:image/[^"\']+)["\'][^>]*>', text
+            if img_tags and name_divs and len(img_tags) == len(name_divs):
+                logger.info(
+                    f"Found {len(img_tags)} image+name pairs for {highway_code}"
                 )
-                if img_matches:
-                    logger.info(
-                        f"Found {len(img_matches)} image tags for {highway_code}"
+                for i, (img_data, name) in enumerate(zip(img_tags, name_divs)):
+                    cameras.append(
+                        {
+                            "id": f"{highway_code}-{i+1}",
+                            "name": name.strip(),
+                            "image": img_data,
+                        }
                     )
-                    for i, img_data in enumerate(img_matches):
-                        cameras.append(
-                            {
-                                "id": f"{highway_code}-{i+1}",
-                                "name": f"Camera {i+1}",
-                                "image": img_data,
-                            }
-                        )
+            elif img_tags:
+                logger.info(
+                    f"Found {len(img_tags)} images without matching names for {highway_code}"
+                )
+                for i, img_data in enumerate(img_tags):
+                    cameras.append(
+                        {
+                            "id": f"{highway_code}-{i+1}",
+                            "name": f"{highway_code} Camera {i+1}",
+                            "image": img_data,
+                        }
+                    )
 
-            # Approach 3: Look for base64 data directly
+            # If still no cameras found, look for base64 data directly
             if not cameras:
                 base64_matches = re.findall(
                     r'data:image/(?:jpeg|png|gif);base64,([^"\'}\s]+)', text
@@ -180,7 +126,7 @@ async def fetch_camera_data(highway_code: str) -> List[Dict]:
                         cameras.append(
                             {
                                 "id": f"{highway_code}-{i+1}",
-                                "name": f"Camera {i+1}",
+                                "name": f"{highway_code} Camera {i+1}",
                                 "image": f"data:image/jpeg;base64,{img_data}",
                             }
                         )
@@ -192,9 +138,7 @@ async def fetch_camera_data(highway_code: str) -> List[Dict]:
                 return cameras
 
             logger.error(f"No camera data found in HTML response for {highway_code}")
-            logger.debug(
-                f"Response content: {text[:500]}..."
-            )  # Log first 500 chars for debugging
+            logger.debug(f"Response content: {text[:500]}...")
             return []
 
     except httpx.RequestError as e:
@@ -240,8 +184,6 @@ async def update_highway_data(highway_code: str):
                     camera_id=str(cam.get("id", f"{highway_code}-{i}")),
                     location_id=highway_code,
                     name=cam.get("name", f"Camera {i+1}"),
-                    url=f"https://www.llm.gov.my/assets/ajax.vigroot.php?h={highway_code}&c={cam.get('id', '')}",
-                    base64_image=cam.get("image", ""),
                     last_updated=datetime.now(),
                 )
                 for i, cam in enumerate(cameras_data)
@@ -265,14 +207,24 @@ async def update_highway_data(highway_code: str):
 
         for camera in highway.cameras:
             try:
-                if not camera.base64_image:
+                # Get image data from cameras_data
+                camera_data = next(
+                    (
+                        cam
+                        for cam in cameras_data
+                        if str(cam.get("id")) == camera.camera_id
+                    ),
+                    None,
+                )
+
+                if not camera_data or not camera_data.get("image"):
                     logger.warning(
                         f"No image data for camera {camera.camera_id} ({camera.name})"
                     )
                     continue
 
                 # Remove data:image/jpeg;base64, prefix if present
-                base64_data = camera.base64_image.split(",")[-1].strip()
+                base64_data = camera_data["image"].split(",")[-1].strip()
                 if not base64_data:
                     logger.warning(
                         f"Empty base64 data for camera {camera.camera_id} ({camera.name})"
@@ -352,20 +304,22 @@ async def startup_event():
             )
             active_highways[code] = highway
 
-        # Add specific scheduler job for NKV highway
-        scheduler.add_job(
-            update_highway_data,
-            trigger=IntervalTrigger(minutes=5),  # Set to run every 5 minutes
-            args=["NKV"],
-            id="update_NKV",
-            replace_existing=True,
-        )
+            # Add scheduler job for each highway
+            scheduler.add_job(
+                update_highway_data,
+                trigger=IntervalTrigger(minutes=5),  # Set to run every 5 minutes
+                args=[code],
+                id=f"update_{code}",
+                replace_existing=True,
+            )
 
-        # Fetch initial data asynchronously
-        asyncio.create_task(update_highway_data("NKV"))
+            # Fetch initial data for all highways asynchronously
+            asyncio.create_task(update_highway_data(code))
 
         scheduler.start()
-        logger.info("Application startup complete. Initialized NKV highway monitoring.")
+        logger.info(
+            f"Application startup complete. Initialized {len(HIGHWAYS)} highways for monitoring."
+        )
     except Exception as e:
         logger.error(f"Error in startup: {str(e)}")
         raise
@@ -463,13 +417,24 @@ async def get_latest_camera_image(highway_code: str, camera_id: str):
             async with aiofiles.open(metadata_file, "r") as f:
                 metadata = json.loads(await f.read())
 
-        # Stream the image response
+            # Return formatted response with image and metadata
+            return JSONResponse(
+                {
+                    "highway_code": highway_code,
+                    "highway_name": HIGHWAYS[highway_code]["name"],
+                    "camera_id": camera_id,
+                    "camera_name": metadata.get("camera_name", ""),
+                    "timestamp": metadata.get("timestamp", ""),
+                    "image_url": f"/static/{latest_image.name}",
+                }
+            )
+
+        # Stream the image response if no metadata
         return StreamingResponse(
             stream_image_chunks(latest_image),
             media_type="image/jpeg",
             headers={
                 "Content-Disposition": f'attachment; filename="{latest_image.name}"',
-                "X-Image-Metadata": json.dumps(metadata) if metadata else "",
             },
         )
 
@@ -499,6 +464,10 @@ async def get_highway_latest_images(highway_code: str):
         )
 
         images = []
+        camera_processed = (
+            set()
+        )  # Track processed cameras to get only latest per camera
+
         for image_file in image_files:
             # Get corresponding metadata file
             metadata_file = METADATA_DIR / f"{image_file.stem}.json"
@@ -506,12 +475,19 @@ async def get_highway_latest_images(highway_code: str):
             if metadata_file.exists():
                 async with aiofiles.open(metadata_file, "r") as f:
                     metadata = json.loads(await f.read())
-                    images.append(
-                        {
-                            "image_url": f"/static/{image_file.name}",
-                            "metadata": metadata,
-                        }
-                    )
+                    camera_id = metadata.get("camera_id")
+
+                    # Only add the latest image for each camera
+                    if camera_id and camera_id not in camera_processed:
+                        camera_processed.add(camera_id)
+                        images.append(
+                            {
+                                "image_url": f"/static/{image_file.name}",
+                                "camera_id": camera_id,
+                                "camera_name": metadata.get("camera_name", ""),
+                                "timestamp": metadata.get("timestamp"),
+                            }
+                        )
 
         return {
             "highway_code": highway_code,

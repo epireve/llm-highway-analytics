@@ -9,8 +9,6 @@ class CCTVCamera(BaseModel):
     camera_id: str
     location_id: str
     name: str
-    url: str
-    base64_image: Optional[str] = None
     last_updated: Optional[datetime] = None
 
 
