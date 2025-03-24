@@ -1,0 +1,11 @@
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-dotenv>=1.0.0
+httpx>=0.26.0
+beautifulsoup4>=4.12.2
+python-multipart>=0.0.6
+aiofiles>=23.2.1
+APScheduler>=3.10.4
+pydantic>=2.6.0
+loguru>=0.7.2
+Pillow>=10.2.0 
