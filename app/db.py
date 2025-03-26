@@ -282,18 +282,33 @@ async def save_camera_image(
 
 
 async def get_latest_camera_images(
-    highway_code: str = None, camera_id: str = None, limit: int = 100
+    highway_code: str = None,
+    camera_id: str = None,
+    limit: int = 100,
+    from_time: str = None,
+    to_time: str = None,
 ) -> List[Dict]:
     """
     Get the latest camera images with flexible filtering:
     - Filter by highway_code if provided
     - Filter by camera_id if provided
-    - If both provided, filter by both
-    - If neither provided, return latest images across all cameras
+    - Filter by from_time and to_time if provided
+    - If multiple filters provided, combine them
     """
     try:
         client = get_pb_client()
         camera_filter = ""
+        time_filter = ""
+
+        # Build time filter if provided
+        if from_time or to_time:
+            conditions = []
+            if from_time:
+                conditions.append(f'capture_time >= "{from_time}"')
+            if to_time:
+                conditions.append(f'capture_time <= "{to_time}"')
+            if conditions:
+                time_filter = " && ".join(conditions)
 
         # Case 1: Both highway_code and camera_id provided
         if highway_code and camera_id:
@@ -365,16 +380,28 @@ async def get_latest_camera_images(
                 logger.error(f"Error getting camera by id: {str(e)}")
                 return []
 
+        # Combine filters
+        filter_conditions = []
+        if camera_filter:
+            filter_conditions.append(camera_filter)
+        if time_filter:
+            filter_conditions.append(time_filter)
+
+        combined_filter = " && ".join(filter_conditions) if filter_conditions else None
+
         # Get images based on the constructed filter
         query_params = {
             "sort": "-capture_time",
-            "expand": "camera,camera.highway",
             "limit": limit,
         }
 
-        if camera_filter:
-            query_params["filter"] = camera_filter
+        # Add expand parameter to query
+        query_params["expand"] = "camera,camera.highway"
 
+        if combined_filter:
+            query_params["filter"] = combined_filter
+
+        logger.debug(f"PocketBase query params: {query_params}")
         images = client.collection("camera_images").get_full_list(
             query_params=query_params
         )
@@ -383,28 +410,42 @@ async def get_latest_camera_images(
         result = []
         for img in images:
             try:
-                camera_data = img.expand.get("camera", {})
-                highway_data = camera_data.expand.get("highway", {})
+                # Get camera data - either from expansion or fetch it directly
+                if hasattr(img, "expand") and img.expand:
+                    # Using expansion
+                    camera_data = img.expand.get("camera", {})
+                    highway_data = (
+                        camera_data.expand.get("highway", {})
+                        if hasattr(camera_data, "expand")
+                        else {}
+                    )
+                else:
+                    # Fetch directly if expansion doesn't work
+                    camera_data = client.collection("cameras").get_one(img.camera)
+                    highway_data = client.collection("highways").get_one(
+                        camera_data.highway
+                    )
 
-                result.append(
-                    {
-                        "id": img.id,
-                        "image_path": img.image_path,
-                        "capture_time": img.capture_time,
-                        "file_size": img.file_size,
-                        "camera": {
-                            "id": camera_data.id,
-                            "camera_id": camera_data.camera_id,
-                            "name": camera_data.name,
-                            "location_id": camera_data.location_id,
-                        },
-                        "highway": {
-                            "id": highway_data.id if highway_data else None,
-                            "code": highway_data.code if highway_data else None,
-                            "name": highway_data.name if highway_data else None,
-                        },
-                    }
-                )
+                # Create the result dictionary with safety checks
+                result_item = {
+                    "id": img.id,
+                    "image_path": img.image_path,
+                    "capture_time": img.capture_time,
+                    "file_size": img.file_size,
+                    "camera": {
+                        "id": getattr(camera_data, "id", None),
+                        "camera_id": getattr(camera_data, "camera_id", None),
+                        "name": getattr(camera_data, "name", None),
+                        "location_id": getattr(camera_data, "location_id", None),
+                    },
+                    "highway": {
+                        "id": getattr(highway_data, "id", None),
+                        "code": getattr(highway_data, "code", None),
+                        "name": getattr(highway_data, "name", None),
+                    },
+                }
+
+                result.append(result_item)
             except Exception as e:
                 logger.error(f"Error processing image record: {str(e)}")
                 continue

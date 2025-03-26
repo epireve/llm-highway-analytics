@@ -1,4 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    Path as FastAPIPath,
+    APIRouter,
+    Request,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import (
@@ -14,12 +21,12 @@ from loguru import logger
 import httpx
 import asyncio
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from .models import CCTVCamera, Highway, HighwayList
 from .config import HIGHWAYS, get_highway_list
 import aiofiles
-from typing import Dict, List, AsyncGenerator
+from typing import Dict, List, AsyncGenerator, Optional
 import json
 import base64
 import re
@@ -41,7 +48,25 @@ SCRAPE_INTERVAL_MINUTES = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "5"))
 # Configure logging
 logger.add("scraper.log", rotation="500 MB")
 
-app = FastAPI(title="LLM Highway Analytics API")
+app = FastAPI(
+    title="LLM Highway Analytics API",
+    description="""
+    API for accessing Malaysian highway camera data and images.
+    
+    ## Features
+    - List all highways and their cameras
+    - Get real-time camera images
+    - Filter images by timestamp
+    - Smart timestamp parsing (supports ISO, date-only, time-only formats)
+    """,
+    version="1.0.0",
+    openapi_tags=[
+        {
+            "name": "v1",
+            "description": "Version 1 API endpoints with enhanced features and flexible timestamp support",
+        }
+    ],
+)
 
 # Configure CORS - More permissive for development
 app.add_middleware(
@@ -78,6 +103,295 @@ active_highways: Dict[str, Highway] = {}
 
 # Configure templates
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+# Create API router with version prefix
+api_v1 = APIRouter(
+    prefix="/api/v1",
+    tags=["v1"],
+    responses={404: {"description": "Not found"}},
+)
+
+
+# Move all endpoints to v1 router
+@api_v1.get("/highways", response_model=HighwayList)
+async def get_highways():
+    """Get list of all highways"""
+    highways = [
+        Highway(
+            id=data["id"],
+            code=code,
+            name=data["name"],
+            cameras=active_highways[code].cameras if code in active_highways else [],
+        )
+        for code, data in HIGHWAYS.items()
+    ]
+    return HighwayList(highways=highways)
+
+
+@api_v1.get("/highways/{highway_code}", response_model=Highway)
+async def get_highway(
+    highway_code: str = FastAPIPath(..., description="The code of the highway")
+):
+    """Get details for a specific highway"""
+    if highway_code not in HIGHWAYS:
+        raise HTTPException(status_code=404, detail="Highway not found")
+
+    highway_data = HIGHWAYS[highway_code]
+    cameras = (
+        active_highways[highway_code].cameras if highway_code in active_highways else []
+    )
+
+    return Highway(
+        id=highway_data["id"],
+        code=highway_code,
+        name=highway_data["name"],
+        cameras=cameras,
+    )
+
+
+@api_v1.get("/cameras", response_model=List[Dict])
+async def get_cameras(
+    highway_code: Optional[str] = None, limit: int = Query(100, ge=1, le=500)
+):
+    """List all available cameras, optionally filtered by highway"""
+    try:
+        if highway_code:
+            if highway_code not in active_highways:
+                raise HTTPException(status_code=404, detail="Highway not found")
+            return active_highways[highway_code].cameras
+        else:
+            # Return all cameras from all highways
+            all_cameras = []
+            for code, highway in active_highways.items():
+                for camera in highway.cameras:
+                    camera_data = camera.dict()
+                    camera_data["highway_code"] = code
+                    camera_data["highway_name"] = highway.name
+                    all_cameras.append(camera_data)
+            return all_cameras[:limit]
+    except Exception as e:
+        logger.error(f"Error getting cameras: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_v1.get("/cameras/{camera_id}/latest", response_model=Dict)
+async def get_camera_latest_image(
+    camera_id: str = FastAPIPath(..., description="The ID of the camera")
+):
+    """Get the latest image from a specific camera"""
+    try:
+        images = await get_latest_camera_images(camera_id=camera_id, limit=1)
+        if not images:
+            raise HTTPException(
+                status_code=404, detail=f"No images found for camera {camera_id}"
+            )
+        latest_image = images[0]
+        return {
+            "camera_id": latest_image["camera"]["camera_id"],
+            "camera_name": latest_image["camera"]["name"],
+            "highway_code": latest_image["highway"]["code"],
+            "highway_name": latest_image["highway"]["name"],
+            "timestamp": latest_image["capture_time"],
+            "image_url": latest_image["image_path"],
+            "file_size": latest_image["file_size"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting latest image: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_v1.get("/cameras/{camera_id}/images/{timestamp}", response_model=Dict)
+async def get_camera_image_by_timestamp(
+    camera_id: str = FastAPIPath(..., description="The ID of the camera"),
+    timestamp: str = FastAPIPath(
+        ..., description="Timestamp in format YYYY-MM-DD, HH:MM, or just HH"
+    ),
+):
+    """Get image from a specific camera that's closest to the provided timestamp"""
+    try:
+        target_time = parse_smart_timestamp(timestamp)
+        time_range = timedelta(hours=2)
+        from_time = target_time - time_range
+        to_time = target_time + time_range
+
+        images = await get_latest_camera_images(
+            camera_id=camera_id,
+            limit=100,
+            from_time=from_time.isoformat(),
+            to_time=to_time.isoformat(),
+        )
+
+        if not images:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No images found for camera {camera_id} around {timestamp}",
+            )
+
+        nearest_image = find_nearest_image(images, target_time)
+        return {
+            "camera_id": nearest_image["camera"]["camera_id"],
+            "camera_name": nearest_image["camera"]["name"],
+            "highway_code": nearest_image["highway"]["code"],
+            "highway_name": nearest_image["highway"]["name"],
+            "requested_time": timestamp,
+            "actual_time": nearest_image["capture_time"],
+            "image_url": nearest_image["image_path"],
+            "file_size": nearest_image["file_size"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting image by timestamp: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_v1.get("/cameras/{camera_id}/images", response_model=Dict)
+async def get_camera_images_by_range(
+    camera_id: str = FastAPIPath(..., description="The ID of the camera"),
+    from_time: Optional[str] = Query(
+        None, description="Start timestamp (YYYY-MM-DD, HH:MM, or just HH)"
+    ),
+    to_time: Optional[str] = Query(
+        None, description="End timestamp (YYYY-MM-DD, HH:MM, or just HH)"
+    ),
+):
+    """Get images from a specific camera within a time range"""
+    try:
+        from_datetime = parse_smart_timestamp(from_time) if from_time else None
+        to_datetime = parse_smart_timestamp(to_time) if to_time else None
+
+        if from_datetime and to_datetime and from_datetime > to_datetime:
+            raise HTTPException(
+                status_code=400,
+                detail=f"from_time ({from_time}) must be earlier than to_time ({to_time})",
+            )
+
+        images = await get_latest_camera_images(
+            camera_id=camera_id,
+            limit=limit,
+            from_time=from_datetime.isoformat() if from_datetime else None,
+            to_time=to_datetime.isoformat() if to_datetime else None,
+        )
+
+        if not images:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No images found for camera {camera_id} in the specified time range",
+            )
+
+        formatted_images = [
+            {
+                "camera_id": img["camera"]["camera_id"],
+                "camera_name": img["camera"]["name"],
+                "highway_code": img["highway"]["code"],
+                "highway_name": img["highway"]["name"],
+                "timestamp": img["capture_time"],
+                "image_url": img["image_path"],
+                "file_size": img["file_size"],
+            }
+            for img in images
+        ]
+
+        return {
+            "count": len(formatted_images),
+            "from_time": from_time,
+            "to_time": to_time,
+            "images": formatted_images,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting images by range: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_v1.get("/images", response_model=Dict)
+async def get_images(
+    highway_code: Optional[str] = Query(None, description="Filter by highway code"),
+    camera_id: Optional[str] = Query(None, description="Filter by camera ID"),
+    limit: int = Query(20, description="Maximum number of images to return"),
+):
+    """Get latest images with flexible filtering"""
+    try:
+        images = await get_latest_camera_images(
+            highway_code=highway_code, camera_id=camera_id, limit=limit
+        )
+
+        if not images:
+            if highway_code:
+                await update_highway_data(highway_code)
+                images = await get_latest_camera_images(
+                    highway_code=highway_code, camera_id=camera_id, limit=limit
+                )
+
+        if not images:
+            raise HTTPException(
+                status_code=404, detail="No images found matching the criteria"
+            )
+
+        if camera_id:
+            latest_image = images[0]
+            return {
+                "highway_code": latest_image["highway"]["code"],
+                "highway_name": latest_image["highway"]["name"],
+                "camera_id": latest_image["camera"]["camera_id"],
+                "camera_name": latest_image["camera"]["name"],
+                "timestamp": latest_image["capture_time"],
+                "image_url": latest_image["image_path"],
+            }
+
+        formatted_images = []
+        camera_processed = set()
+
+        for image in images:
+            cam_id = image["camera"]["camera_id"]
+            if highway_code or cam_id not in camera_processed:
+                camera_processed.add(cam_id)
+                formatted_images.append(
+                    {
+                        "highway_code": image["highway"]["code"],
+                        "highway_name": image["highway"]["name"],
+                        "camera_id": cam_id,
+                        "camera_name": image["camera"]["name"],
+                        "timestamp": image["capture_time"],
+                        "image_url": image["image_path"],
+                    }
+                )
+
+        return {
+            "count": len(formatted_images),
+            "images": formatted_images,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting images: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_v1.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "storage_dir": str(STORAGE_DIR),
+        "storage_exists": STORAGE_DIR.exists(),
+        "storage_is_dir": STORAGE_DIR.is_dir(),
+        "active_highways": len(active_highways),
+        "image_count": len(list(IMAGES_DIR.glob("*.jpg"))),
+    }
+
+
+# Include v1 router in the main FastAPI app
+app.include_router(api_v1)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root(request: Request):
+    """Serve the main dashboard"""
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
 async def fetch_camera_data(highway_code: str) -> List[Dict]:
@@ -393,153 +707,53 @@ async def startup_event():
         raise
 
 
-@app.get("/highways", response_model=HighwayList)
-async def get_highways():
-    """Get list of all highways"""
-    highways = [
-        Highway(
-            id=data["id"],
-            code=code,
-            name=data["name"],
-            cameras=active_highways[code].cameras if code in active_highways else [],
-        )
-        for code, data in HIGHWAYS.items()
-    ]
-    return HighwayList(highways=highways)
-
-
-@app.get("/highways/{highway_code}")
-async def get_highway(highway_code: str):
-    """Get details for a specific highway"""
-    if highway_code not in HIGHWAYS:
-        raise HTTPException(status_code=404, detail="Highway not found")
-
-    highway_data = HIGHWAYS[highway_code]
-    cameras = (
-        active_highways[highway_code].cameras if highway_code in active_highways else []
-    )
-
-    return Highway(
-        id=highway_data["id"],
-        code=highway_code,
-        name=highway_data["name"],
-        cameras=cameras,
-    )
-
-
-@app.get("/cameras")
-async def get_cameras(highway_code: str = None):
-    """Get all cameras, optionally filtered by highway"""
-    if highway_code:
-        if highway_code not in active_highways:
-            raise HTTPException(status_code=404, detail="Highway not found")
-        return active_highways[highway_code].cameras
-    else:
-        # Return all cameras from all highways
-        all_cameras = []
-        for code, highway in active_highways.items():
-            all_cameras.extend(highway.cameras)
-        return all_cameras
-
-
-async def stream_image_chunks(
-    image_path: Path, chunk_size: int = 8192
-) -> AsyncGenerator[bytes, None]:
-    """Stream image file in chunks"""
-    async with aiofiles.open(image_path, "rb") as f:
-        while chunk := await f.read(chunk_size):
-            yield chunk
-
-
-@app.get("/images")
-async def get_images(highway_code: str = None, camera_id: str = None, limit: int = 20):
+def parse_smart_timestamp(timestamp_str: str) -> datetime:
     """
-    Get latest images with flexible filtering:
-    - If both highway_code and camera_id are provided, get latest image for that camera
-    - If only highway_code is provided, get latest images for that highway
-    - If neither is provided, get latest images across all highways
+    Parse a flexible timestamp string into a datetime object.
+    Supports various formats including:
+    - ISO format: 2025-03-26T13:30:51
+    - Date only: 2025-03-26 (assumes 00:00:00)
+    - Time only: 13:30 (assumes today's date)
+    - Hour only: 13 (assumes today's date, 00 minutes)
     """
+    now = datetime.now()
+
+    if not timestamp_str:
+        return now
+
+    # Try ISO format first
     try:
-        # Get images based on the provided filters
-        images = await get_latest_camera_images(
-            highway_code=highway_code, camera_id=camera_id, limit=limit
-        )
+        return datetime.fromisoformat(timestamp_str)
+    except ValueError:
+        pass
 
-        if not images and highway_code:
-            # Try to fetch new data if we have a highway code
-            await update_highway_data(highway_code)
-            # Check again
-            images = await get_latest_camera_images(
-                highway_code=highway_code, camera_id=camera_id, limit=limit
-            )
+    # Try date only (YYYY-MM-DD)
+    date_pattern = r"^(\d{4})-(\d{1,2})-(\d{1,2})$"
+    date_match = re.match(date_pattern, timestamp_str)
+    if date_match:
+        year, month, day = map(int, date_match.groups())
+        return datetime(year, month, day, 0, 0, 0)
 
-        if not images:
-            raise HTTPException(
-                status_code=404, detail="No images found matching the criteria"
-            )
+    # Try time only (HH:MM or HH)
+    time_pattern = r"^(\d{1,2})(?::(\d{1,2}))?$"
+    time_match = re.match(time_pattern, timestamp_str)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or 0)
+        return datetime(now.year, now.month, now.day, hour, minute, 0)
 
-        # Format response based on whether we're requesting a single camera or multiple
-        if camera_id:
-            # Single camera response (just the latest image)
-            latest_image = images[0]
-            return {
-                "highway_code": latest_image["highway"]["code"],
-                "highway_name": latest_image["highway"]["name"],
-                "camera_id": latest_image["camera"]["camera_id"],
-                "camera_name": latest_image["camera"]["name"],
-                "timestamp": latest_image["capture_time"],
-                "image_url": latest_image["image_path"],
-            }
-        else:
-            # Format multi-camera response
-            formatted_images = []
-            camera_processed = (
-                set()
-            )  # Track processed cameras to get only latest per camera
-
-            for image in images:
-                cam_id = image["camera"]["camera_id"]
-                if highway_code or cam_id not in camera_processed:
-                    # If filtering by highway, include all images; otherwise just the latest per camera
-                    camera_processed.add(cam_id)
-                    formatted_images.append(
-                        {
-                            "highway_code": image["highway"]["code"],
-                            "highway_name": image["highway"]["name"],
-                            "camera_id": cam_id,
-                            "camera_name": image["camera"]["name"],
-                            "timestamp": image["capture_time"],
-                            "image_url": image["image_path"],
-                        }
-                    )
-
-            return {
-                "count": len(formatted_images),
-                "images": formatted_images,
-            }
-
-    except Exception as e:
-        logger.error(f"Error getting images: {str(e)}")
-        logger.exception("Full error traceback:")
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail=str(e))
+    # If nothing worked, raise an error
+    raise ValueError(f"Unsupported timestamp format: {timestamp_str}")
 
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "storage_dir": str(STORAGE_DIR),
-        "storage_exists": STORAGE_DIR.exists(),
-        "storage_is_dir": STORAGE_DIR.is_dir(),
-        "active_highways": len(active_highways),
-        "image_count": len(list(IMAGES_DIR.glob("*.jpg"))),
-    }
+def find_nearest_image(images: List[dict], target_time: datetime) -> dict:
+    """Find the image with the timestamp closest to the target time"""
+    if not images:
+        return None
 
-
-@app.get("/", response_class=HTMLResponse)
-async def root(request):
-    """Serve the main dashboard"""
-    return templates.TemplateResponse("index.html", {"request": request})
+    # Sort by how close the capture_time is to the target_time
+    sorted_images = sorted(
+        images,
+        key=lambda img: abs(datetime.fromisoformat(img["capture_time"]) - target_time),
+    )
+    return sorted_images[0]

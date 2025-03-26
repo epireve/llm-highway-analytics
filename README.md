@@ -10,6 +10,9 @@ A FastAPI-based service for scraping, storing, and serving CCTV images from Mala
 - Image storage and management
 - Error handling and retry mechanism
 - Comprehensive logging
+- Smart timestamp parsing (supports ISO, date-only, time-only formats)
+- Versioned API endpoints (/api/v1)
+- Flexible image filtering and retrieval
 
 ## Project Structure
 
@@ -114,6 +117,7 @@ This script starts both PocketBase and FastAPI application.
 
 ## API Endpoints
 
+### Legacy Endpoints (Still Available)
 - `GET /highways` - List all highways with camera data
 - `GET /highways/{highway_code}` - Get data for a specific highway
 - `GET /cameras` - List all cameras
@@ -127,8 +131,30 @@ This script starts both PocketBase and FastAPI application.
 - `GET /health` - API health check
 - `GET /static/{filename}` - Access stored images
 
+### Versioned API (v1)
+- `GET /api/v1/cameras` - List all available cameras
+  - Query parameters:
+    - `highway_code` - (Optional) Filter cameras by highway code
+    - `limit` - (Optional) Limit the number of results (default: 100, max: 500)
+
+- `GET /api/v1/cameras/{camera_id}/latest` - Get the latest image from a specific camera
+
+- `GET /api/v1/cameras/{camera_id}/images/{timestamp}` - Get a specific image closest to the timestamp
+  - Supports flexible timestamp formats:
+    - ISO: `2025-03-26T13:30:51`
+    - Date only: `2025-03-26` (assumes 00:00:00)
+    - Time only: `13:30` (assumes today's date)
+    - Hour only: `13` (assumes today's date, 00 minutes)
+
+- `GET /api/v1/cameras/{camera_id}/images` - Get images within a time range
+  - Query parameters:
+    - `from_time` - (Optional) Start timestamp with flexible format
+    - `to_time` - (Optional) End timestamp with flexible format
+    - `limit` - (Optional) Maximum number of images to return (default: 20, max: 100)
+
 ## Endpoint Examples
 
+### Legacy API Examples
 - List all highways:
   ```
   GET /highways
@@ -164,15 +190,91 @@ This script starts both PocketBase and FastAPI application.
   GET /images?camera_id=DUKE-1
   ```
 
-- Get the most recent image for a specific camera on a specific highway:
+### Versioned API Examples
+
+- List all cameras:
   ```
-  GET /images?highway_code=DUKE&camera_id=DUKE-1
+  GET /api/v1/cameras
   ```
 
-- Get more images (adjust limit):
+- List cameras for a specific highway:
   ```
-  GET /images?limit=50
+  GET /api/v1/cameras?highway_code=DUKE
   ```
+
+- Get the latest image from a camera:
+  ```
+  GET /api/v1/cameras/DUKE-1/latest
+  ```
+
+- Get an image from a specific time (returns the nearest match):
+  ```
+  GET /api/v1/cameras/DUKE-1/images/13:30
+  ```
+
+- Get an image from a specific date:
+  ```
+  GET /api/v1/cameras/DUKE-1/images/2025-03-26
+  ```
+
+- Get images within a time range:
+  ```
+  GET /api/v1/cameras/DUKE-1/images?from_time=13:00&to_time=14:00
+  ```
+
+- Get more images from a time range:
+  ```
+  GET /api/v1/cameras/DUKE-1/images?from_time=2025-03-26&to_time=2025-03-27&limit=50
+  ```
+
+## API Response Formats
+
+### Image Response Format
+All endpoints that return image data use this format:
+```json
+{
+  "camera_id": "DUKE-1",
+  "camera_name": "DUKE Camera 1",
+  "highway_code": "DUKE",
+  "highway_name": "Duta-Ulu Kelang Expressway",
+  "timestamp": "2025-03-26T13:30:51",
+  "image_url": "/static/DUKE_DUKE-1_20250326_133051.jpg",
+  "file_size": 12345
+}
+```
+
+### Health Check Response Format
+The health endpoint (`GET /api/v1/health`) returns:
+```json
+{
+  "status": "healthy",
+  "storage_dir": "/path/to/storage",
+  "storage_exists": true,
+  "storage_is_dir": true,
+  "active_highways": 15,
+  "image_count": 1234
+}
+```
+
+### Error Response Format
+Error responses follow this format:
+```json
+{
+  "detail": "Error message describing what went wrong"
+}
+```
+
+## Image URLs
+
+Images are served from the `/static` endpoint. The URL format is:
+```
+/static/{HIGHWAY_CODE}_{CAMERA_ID}_{YYYYMMDD}_{HHMMSS}.jpg
+```
+
+Example:
+```
+/static/DUKE_DUKE-1_20250326_133051.jpg
+```
 
 ## Troubleshooting
 
@@ -180,6 +282,9 @@ This script starts both PocketBase and FastAPI application.
 - Ensure PocketBase is running before starting the FastAPI application
 - Verify the correct admin credentials are set in `.env`
 - Make sure the required collections exist in PocketBase
+- Check both `fastapi.log` and `pocketbase.log` for service-specific issues
+- Verify network connectivity for image scraping
+- Ensure proper permissions on storage directories
 
 ## Development
 
@@ -187,7 +292,13 @@ To set up a development environment:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 ```
+
+For development best practices:
+1. Use the `--reload` flag with uvicorn for auto-reloading
+2. Check the OpenAPI docs at `/docs` for testing endpoints
+3. Monitor the log files in real-time using `tail -f scraper.log`
+4. Use the health endpoint to verify system status
