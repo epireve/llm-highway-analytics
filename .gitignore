@@ -50,3 +50,18 @@ pocketbase/pb_data/data.db-wal
 pocketbase/pb_data/auxiliary.db-wal
 pocketbase/pb_data/auxiliary.db-shm
 scraper.pid
+
+# PocketBase data
+pocketbase/pb_data/
+*.db
+
+# Logs
+logs/
+scraper.log
+pocketbase.log
+fastapi.log
+
+# Storage
+storage/
+storage/images/
+storage/metadata/
