@@ -145,13 +145,12 @@ async def save_images(highway_code: str):
             logger.warning(f"No cameras found for highway {highway_code}")
             return
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now()
 
         for camera in cameras:
             try:
-                # Generate filenames
-                image_filename = f"{highway_code}_{camera['id']}_{timestamp}.jpg"
-                metadata_filename = f"{highway_code}_{camera['id']}_{timestamp}.json"
+                # Generate filename
+                image_filename = f"{highway_code}_{camera['id']}_{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
                 image_path = IMAGES_DIR / image_filename
 
                 # Extract and save image data in chunks
@@ -180,20 +179,13 @@ async def save_images(highway_code: str):
 
                         logger.info(f"Saved image from URL: {image_filename}")
 
-                # Save metadata
-                metadata = {
-                    "highway_code": highway_code,
-                    "highway_name": HIGHWAYS[highway_code]["name"],
-                    "camera_id": camera["id"],
-                    "camera_name": camera["name"],
-                    "timestamp": timestamp,
-                    "image_filename": image_filename,
-                }
-
-                metadata_path = METADATA_DIR / metadata_filename
-                with open(metadata_path, "w") as f:
-                    json.dump(metadata, f, indent=2)
-                logger.info(f"Saved metadata: {metadata_filename}")
+                # Save to PocketBase
+                await save_camera_image(
+                    camera_id=camera["id"],
+                    image_path=f"/static/{image_filename}",
+                    timestamp=timestamp,
+                    file_size=image_path.stat().st_size,
+                )
 
             except Exception as e:
                 logger.error(

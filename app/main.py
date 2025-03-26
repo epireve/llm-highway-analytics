@@ -294,21 +294,6 @@ async def update_highway_data(highway_code: str):
                 async with aiofiles.open(file_path, "wb") as f:
                     await f.write(image_data)
 
-                # Save metadata
-                metadata = {
-                    "highway_code": highway_code,
-                    "highway_name": HIGHWAYS[highway_code]["name"],
-                    "camera_id": camera.camera_id,
-                    "camera_name": camera.name,
-                    "timestamp": timestamp.isoformat(),
-                    "image_path": str(file_path),
-                    "image_size_bytes": len(image_data),
-                }
-
-                metadata_path = METADATA_DIR / f"{filename.replace('.jpg', '.json')}"
-                async with aiofiles.open(metadata_path, "w") as f:
-                    await f.write(json.dumps(metadata, indent=2))
-
                 # Save to PocketBase
                 await save_camera_image(
                     camera_id=camera.camera_id,
@@ -319,7 +304,7 @@ async def update_highway_data(highway_code: str):
 
                 saved_count += 1
                 logger.info(
-                    f"Saved image ({len(image_data)} bytes) and metadata for camera {camera.name} ({camera.camera_id})"
+                    f"Saved image ({len(image_data)} bytes) for camera {camera.name} ({camera.camera_id})"
                 )
 
             except Exception as e:
@@ -449,62 +434,32 @@ async def stream_image_chunks(
 async def get_latest_camera_image(highway_code: str, camera_id: str):
     """Get the latest image for a specific camera"""
     try:
-        if highway_code not in active_highways:
-            raise HTTPException(status_code=404, detail="Highway not found")
+        # Get latest image from PocketBase
+        images = await get_latest_camera_images(highway_code=highway_code, limit=1)
 
-        # Use NKVE prefix for consistency
-        highway_prefix = "NKVE" if highway_code == "NKV" else highway_code
-
-        # Find the latest image for this camera
-        image_files = sorted(
-            [f for f in IMAGES_DIR.glob(f"{highway_prefix}_{camera_id}_*.jpg")],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
-
-        if not image_files:
+        if not images:
             # Try to fetch new image
             await update_highway_data(highway_code)
             # Check again
-            image_files = sorted(
-                [f for f in IMAGES_DIR.glob(f"{highway_prefix}_{camera_id}_*.jpg")],
-                key=lambda x: x.stat().st_mtime,
-                reverse=True,
-            )
+            images = await get_latest_camera_images(highway_code=highway_code, limit=1)
 
-        if not image_files:
+        if not images:
             raise HTTPException(
                 status_code=404, detail="No images found for this camera"
             )
 
-        latest_image = image_files[0]
-        metadata_file = METADATA_DIR / f"{latest_image.stem}.json"
+        latest_image = images[0]
 
-        # Read metadata if available
-        metadata = None
-        if metadata_file.exists():
-            async with aiofiles.open(metadata_file, "r") as f:
-                metadata = json.loads(await f.read())
-
-            # Return formatted response with image and metadata
-            return JSONResponse(
-                {
-                    "highway_code": highway_code,
-                    "highway_name": HIGHWAYS[highway_code]["name"],
-                    "camera_id": camera_id,
-                    "camera_name": metadata.get("camera_name", ""),
-                    "timestamp": metadata.get("timestamp", ""),
-                    "image_url": f"/static/{latest_image.name}",
-                }
-            )
-
-        # Stream the image response if no metadata
-        return StreamingResponse(
-            stream_image_chunks(latest_image),
-            media_type="image/jpeg",
-            headers={
-                "Content-Disposition": f'attachment; filename="{latest_image.name}"',
-            },
+        # Return formatted response
+        return JSONResponse(
+            {
+                "highway_code": highway_code,
+                "highway_name": latest_image["highway"]["name"],
+                "camera_id": latest_image["camera"]["camera_id"],
+                "camera_name": latest_image["camera"]["name"],
+                "timestamp": latest_image["capture_time"],
+                "image_url": latest_image["image_path"],
+            }
         )
 
     except Exception as e:
@@ -522,53 +477,44 @@ async def get_highway_latest_images(highway_code: str):
         if highway_code not in HIGHWAYS:
             raise HTTPException(status_code=404, detail="Highway not found")
 
-        # Use NKVE prefix for consistency
-        highway_prefix = "NKVE" if highway_code == "NKV" else highway_code
+        # Get latest images from PocketBase
+        images = await get_latest_camera_images(highway_code=highway_code)
 
-        # Find all images for this highway
-        image_files = sorted(
-            [f for f in IMAGES_DIR.glob(f"{highway_prefix}_*.jpg")],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
+        if not images:
+            raise HTTPException(
+                status_code=404, detail="No images found for this highway"
+            )
 
-        images = []
+        # Format response
+        formatted_images = []
         camera_processed = (
             set()
         )  # Track processed cameras to get only latest per camera
 
-        for image_file in image_files:
-            # Get corresponding metadata file
-            metadata_file = METADATA_DIR / f"{image_file.stem}.json"
-
-            if metadata_file.exists():
-                async with aiofiles.open(metadata_file, "r") as f:
-                    metadata = json.loads(await f.read())
-                    camera_id = metadata.get("camera_id")
-
-                    # Only add the latest image for each camera
-                    if camera_id and camera_id not in camera_processed:
-                        camera_processed.add(camera_id)
-                        images.append(
-                            {
-                                "image_url": f"/static/{image_file.name}",
-                                "camera_id": camera_id,
-                                "camera_name": metadata.get("camera_name", ""),
-                                "timestamp": metadata.get("timestamp"),
-                            }
-                        )
+        for image in images:
+            camera_id = image["camera"]["camera_id"]
+            if camera_id not in camera_processed:
+                camera_processed.add(camera_id)
+                formatted_images.append(
+                    {
+                        "image_url": image["image_path"],
+                        "camera_id": camera_id,
+                        "camera_name": image["camera"]["name"],
+                        "timestamp": image["capture_time"],
+                    }
+                )
 
         return {
             "highway_code": highway_code,
             "highway_name": HIGHWAYS[highway_code]["name"],
-            "images": images,
+            "images": formatted_images,
         }
 
     except Exception as e:
-        logger.error(
-            f"Error getting latest images for highway {highway_code}: {str(e)}"
-        )
+        logger.error(f"Error in get_highway_latest_images: {str(e)}")
         logger.exception("Full error traceback:")
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))
 
 

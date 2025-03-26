@@ -43,3 +43,10 @@ storage/images/
 # OS specific
 .DS_Store
 Thumbs.db 
+
+pocketbase/pb_data/data.db
+pocketbase/pb_data/data.db-shm
+pocketbase/pb_data/data.db-wal
+pocketbase/pb_data/auxiliary.db-wal
+pocketbase/pb_data/auxiliary.db-shm
+scraper.pid
