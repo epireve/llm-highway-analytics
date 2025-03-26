@@ -1,6 +1,15 @@
-# JalanOw Analytics API
+# Highway CCTV Analytics API
 
 A FastAPI-based service for scraping, storing, and serving CCTV images from Malaysian highways, with PocketBase database integration.
+
+## Disclaimer
+
+This project is not officially affiliated with or endorsed by Lembaga Lebuhraya Malaysia (LLM). The CCTV data and images used in this project are owned by [Lembaga Lebuhraya Malaysia (LLM)](https://www.llm.gov.my) and their respective highway concessionaires. This project is for educational and research purposes only.
+
+### Data Attribution
+- Data Source: [Lembaga Lebuhraya Malaysia (LLM)](https://www.llm.gov.my)
+- All CCTV images and related data are the property of LLM and respective highway operators
+- This project does not claim ownership of any data or images
 
 ## Features
 
@@ -302,3 +311,12 @@ For development best practices:
 2. Check the OpenAPI docs at `/docs` for testing endpoints
 3. Monitor the log files in real-time using `tail -f scraper.log`
 4. Use the health endpoint to verify system status
+
+## Legal Notice
+
+This project is provided "as is" without warranty of any kind. Users are responsible for complying with applicable laws and regulations regarding the use of traffic camera data. The developers of this project are not responsible for any misuse of the data or violation of terms of service.
+
+### Usage Restrictions
+- Data and images should not be used for commercial purposes without proper authorization from LLM
+- Users must comply with Malaysian laws and regulations regarding traffic data usage
+- Respect the intellectual property rights of LLM and highway operators
