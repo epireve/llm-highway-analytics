@@ -40,8 +40,8 @@ This project is not officially affiliated with or endorsed by Lembaga Lebuhraya 
 
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
-   cd jalanow-analytics
+   git clone https://github.com/epireve/highway-cctv-analytics.git
+   cd highway-cctv-analytics
    ```
 
 2. Create a virtual environment and activate it:
