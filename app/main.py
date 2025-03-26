@@ -327,6 +327,19 @@ async def startup_event():
     """Initialize the application"""
     try:
         logger.info("Starting highway monitoring application...")
+        logger.info("API endpoints available at:")
+        logger.info("  - GET /highways - List all highways with camera data")
+        logger.info(
+            "  - GET /highways/{highway_code} - Get details for a specific highway"
+        )
+        logger.info(
+            "  - GET /cameras?highway_code={code} - Get cameras (optionally filtered by highway)"
+        )
+        logger.info(
+            "  - GET /images?highway_code={code}&camera_id={id}&limit={n} - Get images with flexible filtering"
+        )
+        logger.info("  - GET /health - API health check")
+        logger.info("  - GET / - Web dashboard")
 
         # Initialize PocketBase collections
         try:
@@ -373,6 +386,7 @@ async def startup_event():
         logger.info(
             f"Application startup complete. Initialized {len(HIGHWAYS)} highways for monitoring."
         )
+        logger.info(f"Images will be updated every {SCRAPE_INTERVAL_MINUTES} minutes.")
     except Exception as e:
         logger.error(f"Error in startup: {str(e)}")
         logger.exception("Full startup error traceback:")
@@ -413,12 +427,19 @@ async def get_highway(highway_code: str):
     )
 
 
-@app.get("/highways/{highway_code}/cameras")
-async def get_highway_cameras(highway_code: str):
-    """Get all cameras for a specific highway"""
-    if highway_code not in active_highways:
-        raise HTTPException(status_code=404, detail="Highway not found")
-    return active_highways[highway_code].cameras
+@app.get("/cameras")
+async def get_cameras(highway_code: str = None):
+    """Get all cameras, optionally filtered by highway"""
+    if highway_code:
+        if highway_code not in active_highways:
+            raise HTTPException(status_code=404, detail="Highway not found")
+        return active_highways[highway_code].cameras
+    else:
+        # Return all cameras from all highways
+        all_cameras = []
+        for code, highway in active_highways.items():
+            all_cameras.extend(highway.cameras)
+        return all_cameras
 
 
 async def stream_image_chunks(
@@ -430,88 +451,75 @@ async def stream_image_chunks(
             yield chunk
 
 
-@app.get("/highways/{highway_code}/cameras/{camera_id}/latest")
-async def get_latest_camera_image(highway_code: str, camera_id: str):
-    """Get the latest image for a specific camera"""
+@app.get("/images")
+async def get_images(highway_code: str = None, camera_id: str = None, limit: int = 20):
+    """
+    Get latest images with flexible filtering:
+    - If both highway_code and camera_id are provided, get latest image for that camera
+    - If only highway_code is provided, get latest images for that highway
+    - If neither is provided, get latest images across all highways
+    """
     try:
-        # Get latest image from PocketBase
-        images = await get_latest_camera_images(highway_code=highway_code, limit=1)
+        # Get images based on the provided filters
+        images = await get_latest_camera_images(
+            highway_code=highway_code, camera_id=camera_id, limit=limit
+        )
 
-        if not images:
-            # Try to fetch new image
+        if not images and highway_code:
+            # Try to fetch new data if we have a highway code
             await update_highway_data(highway_code)
             # Check again
-            images = await get_latest_camera_images(highway_code=highway_code, limit=1)
+            images = await get_latest_camera_images(
+                highway_code=highway_code, camera_id=camera_id, limit=limit
+            )
 
         if not images:
             raise HTTPException(
-                status_code=404, detail="No images found for this camera"
+                status_code=404, detail="No images found matching the criteria"
             )
 
-        latest_image = images[0]
-
-        # Return formatted response
-        return JSONResponse(
-            {
-                "highway_code": highway_code,
+        # Format response based on whether we're requesting a single camera or multiple
+        if camera_id:
+            # Single camera response (just the latest image)
+            latest_image = images[0]
+            return {
+                "highway_code": latest_image["highway"]["code"],
                 "highway_name": latest_image["highway"]["name"],
                 "camera_id": latest_image["camera"]["camera_id"],
                 "camera_name": latest_image["camera"]["name"],
                 "timestamp": latest_image["capture_time"],
                 "image_url": latest_image["image_path"],
             }
-        )
+        else:
+            # Format multi-camera response
+            formatted_images = []
+            camera_processed = (
+                set()
+            )  # Track processed cameras to get only latest per camera
+
+            for image in images:
+                cam_id = image["camera"]["camera_id"]
+                if highway_code or cam_id not in camera_processed:
+                    # If filtering by highway, include all images; otherwise just the latest per camera
+                    camera_processed.add(cam_id)
+                    formatted_images.append(
+                        {
+                            "highway_code": image["highway"]["code"],
+                            "highway_name": image["highway"]["name"],
+                            "camera_id": cam_id,
+                            "camera_name": image["camera"]["name"],
+                            "timestamp": image["capture_time"],
+                            "image_url": image["image_path"],
+                        }
+                    )
+
+            return {
+                "count": len(formatted_images),
+                "images": formatted_images,
+            }
 
     except Exception as e:
-        logger.error(f"Error in get_latest_camera_image: {str(e)}")
-        logger.exception("Full error traceback:")
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/highways/{highway_code}/latest")
-async def get_highway_latest_images(highway_code: str):
-    """Get the latest images and metadata for a specific highway"""
-    try:
-        if highway_code not in HIGHWAYS:
-            raise HTTPException(status_code=404, detail="Highway not found")
-
-        # Get latest images from PocketBase
-        images = await get_latest_camera_images(highway_code=highway_code)
-
-        if not images:
-            raise HTTPException(
-                status_code=404, detail="No images found for this highway"
-            )
-
-        # Format response
-        formatted_images = []
-        camera_processed = (
-            set()
-        )  # Track processed cameras to get only latest per camera
-
-        for image in images:
-            camera_id = image["camera"]["camera_id"]
-            if camera_id not in camera_processed:
-                camera_processed.add(camera_id)
-                formatted_images.append(
-                    {
-                        "image_url": image["image_path"],
-                        "camera_id": camera_id,
-                        "camera_name": image["camera"]["name"],
-                        "timestamp": image["capture_time"],
-                    }
-                )
-
-        return {
-            "highway_code": highway_code,
-            "highway_name": HIGHWAYS[highway_code]["name"],
-            "images": formatted_images,
-        }
-
-    except Exception as e:
-        logger.error(f"Error in get_highway_latest_images: {str(e)}")
+        logger.error(f"Error getting images: {str(e)}")
         logger.exception("Full error traceback:")
         if isinstance(e, HTTPException):
             raise
@@ -529,19 +537,6 @@ async def health_check():
         "active_highways": len(active_highways),
         "image_count": len(list(IMAGES_DIR.glob("*.jpg"))),
     }
-
-
-# Add a new endpoint to get data from PocketBase
-@app.get("/api/images/latest")
-async def get_latest_images(highway_code: str = None, limit: int = 20):
-    """Get latest images from PocketBase"""
-    try:
-        images = await get_latest_camera_images(highway_code, limit)
-        return {"count": len(images), "images": images}
-    except Exception as e:
-        logger.error(f"Error getting latest images: {str(e)}")
-        logger.exception("Full error traceback:")
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/", response_class=HTMLResponse)

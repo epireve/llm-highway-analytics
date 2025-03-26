@@ -115,10 +115,64 @@ This script starts both PocketBase and FastAPI application.
 ## API Endpoints
 
 - `GET /highways` - List all highways with camera data
-- `GET /highway/{highway_code}` - Get data for a specific highway
+- `GET /highways/{highway_code}` - Get data for a specific highway
 - `GET /cameras` - List all cameras
-- `GET /images/{camera_id}` - Get recent images for a specific camera
+  - Query parameters:
+    - `highway_code` - (Optional) Filter cameras by highway code
+- `GET /images` - Get camera images with flexible filtering
+  - Query parameters:
+    - `highway_code` - (Optional) Filter images by highway code
+    - `camera_id` - (Optional) Filter images by camera ID
+    - `limit` - (Optional) Limit the number of results (default: 20)
+- `GET /health` - API health check
 - `GET /static/{filename}` - Access stored images
+
+## Endpoint Examples
+
+- List all highways:
+  ```
+  GET /highways
+  ```
+
+- Get a specific highway:
+  ```
+  GET /highways/DUKE
+  ```
+
+- Get all cameras:
+  ```
+  GET /cameras
+  ```
+
+- Get cameras for a specific highway:
+  ```
+  GET /cameras?highway_code=DUKE
+  ```
+
+- Get all images (most recent from all cameras):
+  ```
+  GET /images
+  ```
+
+- Get images for a specific highway:
+  ```
+  GET /images?highway_code=DUKE
+  ```
+
+- Get the most recent image for a specific camera:
+  ```
+  GET /images?camera_id=DUKE-1
+  ```
+
+- Get the most recent image for a specific camera on a specific highway:
+  ```
+  GET /images?highway_code=DUKE&camera_id=DUKE-1
+  ```
+
+- Get more images (adjust limit):
+  ```
+  GET /images?limit=50
+  ```
 
 ## Troubleshooting
 
@@ -136,4 +190,4 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
-``` 
+```

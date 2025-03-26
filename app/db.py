@@ -282,15 +282,46 @@ async def save_camera_image(
 
 
 async def get_latest_camera_images(
-    highway_code: str = None, limit: int = 100
+    highway_code: str = None, camera_id: str = None, limit: int = 100
 ) -> List[Dict]:
-    """Get the latest camera images, optionally filtered by highway"""
+    """
+    Get the latest camera images with flexible filtering:
+    - Filter by highway_code if provided
+    - Filter by camera_id if provided
+    - If both provided, filter by both
+    - If neither provided, return latest images across all cameras
+    """
     try:
         client = get_pb_client()
+        camera_filter = ""
 
-        if highway_code:
-            # Get highway record
+        # Case 1: Both highway_code and camera_id provided
+        if highway_code and camera_id:
             try:
+                # Get highway record
+                highway = client.collection("highways").get_first_list_item(
+                    f'code = "{highway_code}"'
+                )
+
+                # Get specific camera for this highway and camera_id
+                camera = client.collection("cameras").get_first_list_item(
+                    f'camera_id = "{camera_id}" && highway = "{highway.id}"'
+                )
+
+                if not camera:
+                    return []
+
+                # Filter for this specific camera
+                camera_filter = f'camera = "{camera.id}"'
+
+            except Exception as e:
+                logger.error(f"Error getting specific camera: {str(e)}")
+                return []
+
+        # Case 2: Only highway_code provided
+        elif highway_code:
+            try:
+                # Get highway record
                 highway = client.collection("highways").get_first_list_item(
                     f'code = "{highway_code}"'
                 )
@@ -309,27 +340,44 @@ async def get_latest_camera_images(
                     [f'camera = "{camera_id}"' for camera_id in camera_ids]
                 )
 
-                # Get latest images for these cameras
-                images = client.collection("camera_images").get_full_list(
-                    query_params={
-                        "filter": f"({camera_filter})",
-                        "sort": "-capture_time",
-                        "expand": "camera,camera.highway",
-                        "limit": limit,
-                    }
-                )
+                if camera_filter:
+                    camera_filter = f"({camera_filter})"
+
             except Exception as e:
                 logger.error(f"Error getting highway cameras: {str(e)}")
                 return []
-        else:
-            # Get latest images across all highways
-            images = client.collection("camera_images").get_full_list(
-                query_params={
-                    "sort": "-capture_time",
-                    "expand": "camera,camera.highway",
-                    "limit": limit,
-                }
-            )
+
+        # Case 3: Only camera_id provided
+        elif camera_id:
+            try:
+                # Get camera by camera_id
+                camera = client.collection("cameras").get_first_list_item(
+                    f'camera_id = "{camera_id}"'
+                )
+
+                if not camera:
+                    return []
+
+                # Filter for this camera
+                camera_filter = f'camera = "{camera.id}"'
+
+            except Exception as e:
+                logger.error(f"Error getting camera by id: {str(e)}")
+                return []
+
+        # Get images based on the constructed filter
+        query_params = {
+            "sort": "-capture_time",
+            "expand": "camera,camera.highway",
+            "limit": limit,
+        }
+
+        if camera_filter:
+            query_params["filter"] = camera_filter
+
+        images = client.collection("camera_images").get_full_list(
+            query_params=query_params
+        )
 
         # Process and format results
         result = []
