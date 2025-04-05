@@ -18,113 +18,70 @@ def fetch_cctv_data():
     """Fetch CCTV data from LLM API for multiple regions."""
     url = "https://gis02.llm.gov.my/llmsmpt/rest/services/TMC/Highway_CCTV_Image/FeatureServer/0/query"
 
-    # Define base geometries with different resolutions
-    geometries = []
-
-    # Resolution 1: ~78,271 units (from first working URL)
-    base_width_1 = 78271.517
-    base_height_1 = 78271.517
-
-    # Resolution 2: ~156,543 units (from second working URL)
-    base_width_2 = 156543.034
-    base_height_2 = 156543.034
-
-    # Define the full area to cover
-    full_area = {
-        "xmin": 10018754.171386987,  # Westernmost point
-        "ymin": 0.0,  # Southernmost point
-        "xmax": 11900000.0,  # Easternmost point
-        "ymax": 800000.0,  # Northernmost point
-    }
-
-    # Generate grid cells with both resolutions
-    for base_width, base_height in [
-        (base_width_1, base_height_1),
-        (base_width_2, base_height_2),
-    ]:
-        overlap_factor = 0.5
-        step_x = base_width * (1 - overlap_factor)
-        step_y = base_height * (1 - overlap_factor)
-
-        current_y = full_area["ymin"]
-        while current_y < full_area["ymax"]:
-            current_x = full_area["xmin"]
-            while current_x < full_area["xmax"]:
-                cell = {
-                    "xmin": current_x,
-                    "ymin": current_y,
-                    "xmax": min(current_x + base_width, full_area["xmax"]),
-                    "ymax": min(current_y + base_height, full_area["ymax"]),
-                    "spatialReference": {"wkid": 102100},
-                }
-                geometries.append(cell)
-                current_x += step_x
-            current_y += step_y
-
-    # Add specific known working regions
-    known_regions = [
+    # Define geometry regions to cover all of Peninsular Malaysia
+    geometries = [
         {
-            # Central KL (known working)
-            "xmin": 11271098.44283168,
-            "ymin": 313086.06784793735,
-            "xmax": 11349369.959795732,
-            "ymax": 391357.5848119855,
-            "spatialReference": {"wkid": 102100},
-        },
-        {
-            # Greater KL (known working)
-            "xmin": 11271098.442804527,
-            "ymin": 313086.0678650439,
-            "xmax": 11427641.476732496,
-            "ymax": 469629.1017930098,
-            "spatialReference": {"wkid": 102100},
-        },
-    ]
-    geometries.extend(known_regions)
-
-    # Add specific highway regions
-    highway_regions = [
-        # PLUS North
-        {
-            "xmin": 11271098.442804527,
-            "ymin": 469629.1017930098,
-            "xmax": 11427641.476732496,
+            # Northern region (Perlis, Kedah, Penang, Northern Perak)
+            "xmin": 11000000.0,
+            "ymin": 469629.1017934233,
+            "xmax": 11800000.0,
             "ymax": 800000.0,
             "spatialReference": {"wkid": 102100},
         },
-        # PLUS South
         {
+            # Central region (Selangor, KL, N.Sembilan)
+            "xmin": 11271098.442803863,
+            "ymin": 313086.0678654611,
+            "xmax": 11584184.510673836,
+            "ymax": 469629.1017934233,
+            "spatialReference": {"wkid": 102100},
+        },
+        {
+            # Southern region (Melaka, Johor) - adjusted coordinates
             "xmin": 11271098.442810982,
             "ymin": 100000.0,
             "xmax": 11584184.510673836,
             "ymax": 313086.0678654611,
             "spatialReference": {"wkid": 102100},
         },
-        # East Coast
         {
+            # Eastern region (Pahang, Terengganu, Kelantan)
             "xmin": 11427641.47673183,
             "ymin": 100000.0,
             "xmax": 11900000.0,
             "ymax": 800000.0,
             "spatialReference": {"wkid": 102100},
         },
-        # West Coast
         {
+            # Western region (Western Selangor, Perak)
             "xmin": 10018754.171386987,
             "ymin": 313086.0678654611,
             "xmax": 11271098.442803863,
             "ymax": 800000.0,
             "spatialReference": {"wkid": 102100},
         },
+        {
+            # Far Southern region (Southern Johor)
+            "xmin": 11271098.442810982,
+            "ymin": 0.0,
+            "xmax": 11584184.510673836,
+            "ymax": 100000.0,
+            "spatialReference": {"wkid": 102100},
+        },
     ]
-    geometries.extend(highway_regions)
 
     all_features = []
-    seen_cameras = set()
-    total_features = 0
+    region_names = {
+        1: "Northern",
+        2: "Central",
+        3: "Southern",
+        4: "Eastern",
+        5: "Western",
+        6: "Southwestern",
+    }
 
     for i, geometry in enumerate(geometries, 1):
-        region_name = f"Region {i}"
+        region_name = region_names.get(i, f"Region {i}")
 
         params = {
             "f": "json",
@@ -139,35 +96,22 @@ def fetch_cctv_data():
         }
 
         try:
-            logger.info(f"Fetching data for {region_name}...")
+            logger.info(f"Fetching data for {region_name} region...")
             response = requests.get(url, params=params)
             response.raise_for_status()
             data = response.json()
             features = data.get("features", [])
-            total_features += len(features)
-
-            # Filter out duplicates based on Camera field
-            new_features = []
-            for feature in features:
-                camera = feature.get("attributes", {}).get("Camera")
-                if camera and camera not in seen_cameras:
-                    seen_cameras.add(camera)
-                    new_features.append(feature)
-
-            logger.info(
-                f"Found {len(features)} features in {region_name} (unique: {len(new_features)})"
-            )
-            all_features.extend(new_features)
+            logger.info(f"Found {len(features)} features in {region_name} region")
+            all_features.extend(features)
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching data for {region_name}: {e}")
+            logger.error(f"Error fetching data for {region_name} region: {e}")
             logger.error(
                 f"Response content: {response.text if 'response' in locals() else 'No response'}"
             )
-            continue
+            continue  # Continue with other regions even if one fails
 
-    logger.info(f"Total features found: {total_features}")
-    logger.info(f"Total unique features: {len(all_features)}")
+    logger.info(f"Total features found across all regions: {len(all_features)}")
     return {"features": all_features}
 
 
